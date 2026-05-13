@@ -52,3 +52,48 @@
 #### Container Runtimes - 
 
 
+ **Docker** - is one of the most popular container runtimes currently on the market. It adheres to the **OCI** (Open Container Initiative), and its primary feature is running container images. Its features include: 
+- **Client-Server** Architecture - works by forwarding the CLI commands to a background process (**dockerd**) that manages all container lifecycle operations. Sends request through a socket (Docker's REST API).
+- **dockerd** - *daemon process* that runs with root privileges by default (rootless limited) and uses container runtime components to process requests from the Docker Binary.
+- Can be remote controlled by exposing Docker's API socket on a remote host machine.
+- **Dockerfile** - provides instructions to build container image.
+- **Docker Compose file**  -  defines running containers and reference a **dockerfile** to build and image to use for particular service.
+
+![[docker_daemon.webp]]
+
+
+**Podman** - More lightweight, container runtime that is **Docker**-Compatible CLI without the Docker daemon basically. It has its own GUI called Podman Desktop and is a great alternative to Docker. Its features include:
+- **Rootless** by default - meaning it cannot be compromised if an attacker gains root inside the container. Works by remapping permissions, making the container think it's running on root while in reality it runs on a different UID.
+- **Daemonless** - the container manages its own requests without sending everything to a background process like **dockerd** or by systemd if on linux, which isolates the containers from each other.
+- No single point of failure
+- Lower overhead - when containers aren't running does not consume resources
+- Security - no exposure risk.
+
+
+**Containerd** - is an open-source, lightweight container runtime focused on running in a **rootless architecture**, it adheres to the **OCI**. Its main functionality is managing container lifecycle, it is powering **Kubernetes**, **Docker** as a backend and **cloud platforms** (AWS Fargate, Google Cloud Run, Azure Container Instances). 
+- While lacking many features provided by Docker, it exists as a component in a larger system like **Kubernetes** and **Docker**, not a standalone tool.
+- Used in Kubernetes clusters as the de facto standard
+- Lighter and faster than docker in startup, memory overhead and image pulling
+- Used in IoT devices with limited resources.
+- Used in building custom Container Platforms
+	- Examples include AWS Firecracker, Rancher/K3s, Nomad
+- In order to use it directly there is a tool called **nerdctl** which provides Docker CLI compatibility. 
+
+
+
+| Criterion                    | Docker Engine + Desktop                | Podman + Desktop                     | containerd + nerdctl          |
+| ---------------------------- | -------------------------------------- | ------------------------------------ | ----------------------------- |
+| **Architecture**             | Client-server with root daemon         | Daemonless, fork model               | Minimalist daemon (not root)  |
+| **Root requirement**         | Daemon as root (rootless mode limited) | Rootless by default                  | Can run rootless              |
+| **Docker CLI compatibility** | 100% (this is Docker)                  | ~95% drop-in replacement             | ~98% via nerdctl              |
+| **Compose support**          | Native docker compose                  | podman-compose (~90% coverage)       | nerdctl compose (~95%)        |
+| **Build Dockerfiles**        | BuildKit built-in                      | Buildah integrated                   | BuildKit via buildctl/nerdctl |
+| **Kubernetes integration**   | Deprecated (v1.24+), via containerd    | podman generate/play kube            | Native (K8s default runtime)  |
+| **Startup latency**          | Fast (daemon pre-warmed)               | ~10-15% slower (fork overhead)       | Fastest (minimal runtime)     |
+| **Memory overhead**          | ~100MB daemon + containers             | ~0MB daemon + containers             | ~30MB runtime + containers    |
+| **Security (rootless)**      | Limited rootless support               | Rootless first-class                 | Supports rootless             |
+| **Image registry**           | Docker Hub seamless                    | Compatible (OCI registries)          | Compatible (OCI registries)   |
+| **Windows containers**       | ★★★★★ Native support                   | ★★☆☆☆ Limited, improving             | ★★★☆☆ Via containerd shim     |
+| **macOS/Windows host**       | Docker Desktop (native-like)           | Podman Machine (VM-based)            | nerdctl + Lima VM             |
+| **CI/CD friendliness**       | Good (but shared daemon = risk)        | ★★★★★ Excellent (rootless isolation) | Good (K8s-native pipelines)   |
+| **Production runtime**       | Legacy (K8s deprecated)                | Growing (Red Hat OpenShift)          | ★★★★★ K8s default             |

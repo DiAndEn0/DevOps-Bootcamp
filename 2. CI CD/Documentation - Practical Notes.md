@@ -337,7 +337,7 @@ helm upgrade --install k3s-example-agent gitlab/gitlab-agent \
 Instead, I went ahead and configured **ArgoCD**, a GitOps CD tool for Kubernetes to deploy the image automatically once a commit is being made. By following this [guide](https://argo-cd.readthedocs.io/en/stable/#quick-start) and this [one](https://argo-cd.readthedocs.io/en/stable/getting_started/) I've set up the argo cd server side and client into my cluster, and from there I've used the built-in UI overlay accessed through the browser on my Ubuntu machine to configure the deployment. In the end, it looks like this:
 
 
-![[Pasted image 20260713135820.png|697]]
+<img width="1414" height="372" alt="image" src="https://github.com/user-attachments/assets/6f1d1bc1-a701-4e30-b306-b0b8f55be776" />
 
 These are a few commands I've used to configure the ArgoCD further:
 ```

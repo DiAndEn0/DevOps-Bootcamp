@@ -280,9 +280,9 @@ To satisfy the bootcamp objective of running this check every 5 minutes on the K
 
 1. **Deploy Script on Host VM:**
    ```bash
-   sudo mkdir -p /opt/monitoring/scripts
-   sudo cp cluster_health_check.py /opt/monitoring/scripts/
-   sudo chmod +x /opt/monitoring/scripts/cluster_health_check.py
+   sudo mkdir -p SOME-PATH/scripts
+   sudo cp cluster_health_check.py SOME-PATH/scripts/
+   sudo chmod +x SOME-PATH/scripts/cluster_health_check.py
    ```
 
 2. **Install Required Python Dependencies on VM:**
@@ -296,7 +296,7 @@ To satisfy the bootcamp objective of running this check every 5 minutes on the K
    Edit the crontab using `crontab -e`:
    ```bash
    # Run cluster health check every 5 minutes and log output
-   */5 * * * * /usr/bin/python3 /opt/monitoring/scripts/cluster_health_check.py >> /var/log/cluster_health_check.log 2>&1
+   */5 * * * * /usr/bin/python3 SOME-PATH/scripts/cluster_health_check.py >> /var/log/cluster_health_check.log 2>&1
    ```
 
 4. **Verify Execution:**
@@ -391,7 +391,7 @@ The objective requires running this Bash monitor at **3:00 PM every Sunday**.
 1. **Deploy Script on Host VM:**
    ```bash
    sudo cp vm_weekly_report.sh /opt/monitoring/scripts/
-   sudo chmod +x /opt/monitoring/scripts/vm_weekly_report.sh
+   sudo chmod +x SOME-PATH/vm_weekly_report.sh
    ```
 
 2. **Ensure `sysstat` is Installed & Enabled:**

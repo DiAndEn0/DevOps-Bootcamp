@@ -1,41 +1,32 @@
 # **Up:** [[4. Automation]]
 ---
 
-In this part of the bootcamp, I focused on automating cluster health checks and host monitoring. Rather than manually opening Grafana dashboards or running ad-hoc terminal commands, I developed two dedicated automation scripts:
+Two scripts, both running on the K3s host VM (not inside pods) and scheduled with `cron`:
 
-1. **Python Cluster Health Checker:** Connects directly to Prometheus and Loki HTTP APIs, executes PromQL and LogQL queries, parses the metrics and log streams, evaluates thresholds, and generates both color-coded terminal status output and a standalone HTML report.
-2. **Bash VM Weekly Resource Monitor:** Collects native OS-level CPU (`sar`), memory (`free`), and disk (`df`) statistics, manages automated weekly log rotation, and appends formatted reports to a log file.
-
-Both scripts are deployed to the host OS of the K3s virtual machine and automated using the Linux `cron` daemon.
+1. **Python Health Checker:** queries Prometheus and Loki, compares results to thresholds, prints a color-coded report, and saves it as HTML.
+2. **Bash Resource Monitor:** writes CPU, RAM, and disk usage to a weekly log file.
 
 ---
 
-## Exposing Metrics and Reconfiguring Prometheus
+## Setup: Exposing Prometheus and Loki
 
-Before I could write the Python script, I needed to ensure that Prometheus was actually collecting and exposing the exact metrics I wanted to query. 
+The script needs these metrics in Prometheus:
 
-In the previous monitoring lab, I had instrumented my Spring Boot microservices (`simple-web-app` and `simple-app-sender`) with Micrometer and OpenTelemetry. However, querying comprehensive cluster and host health required more than just application metrics. I had to reconfigure what Prometheus scrapes and exposes:
+| Metric | Source | Used for |
+|---|---|---|
+| `node_cpu_seconds_total`, `node_memory_*` | `node-exporter` | CPU, I/O wait, memory |
+| `http_server_requests_seconds_count` | Micrometer, through the OTel collector | HTTP error rate |
+| `process_resident_memory_bytes` | `kubernetes-services` job | Memory leaks |
 
-1. **Host & Node Metrics:**
-   To calculate total CPU usage, I/O wait, and memory consumption, I needed metrics from `node-exporter` (such as `node_cpu_seconds_total`, `node_memory_MemAvailable_bytes`, and `node_memory_MemTotal_bytes`). I ensured `node-exporter` was running on the host and that Prometheus included a dedicated scrape job for it.
-2. **Application HTTP Request Metrics:**
-   To calculate error rates, I needed `http_server_requests_seconds_count` labeled with HTTP `status` codes (e.g., `200`, `400`, `404`, `500`). I verified that Micrometer was exporting these counters properly through the OpenTelemetry collector.
-3. **Resident Memory Tracking:**
-   To detect potential memory leaks across services over time, Prometheus had to scrape `process_resident_memory_bytes` under the `kubernetes-services` job.
-4. **Exposing APIs to the Host OS:**
-   Because the automation script runs on the K3s host VM (outside of the Kubernetes pod network), it cannot access internal cluster DNS names like `prometheus.bootcamp-v1.svc.cluster.local`. I exposed the services on dedicated NodePorts:
-   - **Prometheus API:** Accessible at `http://localhost:30090`
-   - **Loki API:** Accessible at `http://localhost:31100`
-
-Once the metrics were exposed and targets confirmed healthy in the Prometheus targets UI, I learned how to structure PromQL queries, execute them over HTTP endpoints, and parse the resulting JSON payloads.
+The host can't resolve cluster DNS names (`*.svc.cluster.local`), so I exposed both APIs as NodePorts:
+- **Prometheus:** `http://localhost:30090`
+- **Loki:** `http://localhost:31100`
 
 ---
 
 ## Phase 2: Python Health Checker
 
-### The Python Script
-
-Here is the complete script (`cluster_health_check.py`):
+### The Script (`cluster_health_check.py`)
 
 ```python
 import requests
@@ -192,126 +183,48 @@ console.print(HEALTHY if len(problems) == 0 else WARNING)
 console.save_html("cluster_metrics.html")
 ```
 
----
+### What It Checks
 
-### Deep Dive: How the Script Works
+| Check | Query | Healthy if |
+|---|---|---|
+| HTTP error rate | `rate(http_server_requests_seconds_count[5m])`, counting `4xx`/`5xx` statuses | < 5% |
+| CPU usage | `100 * (1 - avg by(instance) (rate(node_cpu_seconds_total{mode='idle'}[5m])))` | < 95% |
+| I/O wait | `100 * avg by(instance) (rate(node_cpu_seconds_total{mode='iowait'}[5m]))` | < 5% |
+| Memory usage | `100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))` | < 90% |
+| Memory leaks | `delta(process_resident_memory_bytes{job='kubernetes-services'}[24h]) > 0` | No results |
+| Error logs (Loki) | `{service_name=~"simple-app-sender\|simple-web-app"} \|~ "(?i)ERROR\|FAIL"` | No results |
 
-The script queries Prometheus and Loki REST APIs, parses the responses, and formats a report.
+Things worth remembering:
+- Prometheus returns values as `[timestamp, "value"]` strings, so convert them with `float(...[1])`.
+- Use `MemAvailable`, not `MemFree`. Linux uses free RAM for cache, so `MemFree` makes usage look higher than it is.
+- The Loki call is wrapped in `try/except` so a Loki outage doesn't crash the whole script.
+- `rich`'s `Console(record=True)` + `save_html()` turns the terminal output into an HTML report.
 
-#### 1. HTTP Request Error Rate
-- **PromQL Query:** `rate(http_server_requests_seconds_count[5m])`
-- **Mechanism:**
-  - This query retrieves the per-second rate of HTTP requests per endpoint and status over a 5-minute sliding window.
-  - The script iterates through the resulting metric series:
-    ```python
-    for request in requests_dict:
-        if request['metric']['status'].startswith('4') or request['metric']['status'].startswith('5'):
-            errors_count += 1
-        requests_count += 1
-    ```
-  - It checks the `status` label of each series. If it begins with `'4'` (client error) or `'5'` (server error), it increments `errors_count`.
-  - It safely calculates `error_rate = errors_count / requests_count` (guarding against division by zero if there are no requests).
-  - **Threshold:** An error rate under 5% (`< 0.05`) is considered `[HEALTHY]`; anything equal or higher is flagged as `[NOT HEALTHY]`.
+### Cron: Every 5 Minutes
 
-#### 2. Total CPU Usage
-- **PromQL Query:** `100 * (1 - avg by(instance) (rate(node_cpu_seconds_total{mode='idle'}[5m])))`
-- **Mechanism:**
-  - `node_cpu_seconds_total` records seconds spent by each CPU core in different modes (`idle`, `system`, `user`, `iowait`).
-  - Calculating `rate(...{mode='idle'}[5m])` yields the fraction of time the CPU spent idle.
-  - Subtracting this from `1` gives the active CPU load, which is multiplied by `100` to convert to a percentage.
-  - Prometheus returns metric values as strings in a two-item list `[timestamp, "value"]`. The script converts the value using `float(instance['value'][1])` and accumulates the total across instances.
-  - **Threshold:** Total CPU usage under 95% is marked `[HEALTHY]`.
+```bash
+# Install dependencies
+sudo apt install -y python3 python3-pip
+pip3 install requests rich
 
-#### 3. I/O Wait Percentage
-- **PromQL Query:** `100 * avg by(instance) (rate(node_cpu_seconds_total{mode='iowait'}[5m]))`
-- **Mechanism:**
-  - Measures the percentage of CPU time spent waiting for outstanding disk I/O requests.
-  - High I/O wait indicates storage bottlenecks where CPU cores are stalled waiting for disk reads/writes.
-  - **Threshold:** Under 5% is `[HEALTHY]`; higher values indicate disk bottlenecks and trigger `[NOT HEALTHY]`.
+# Deploy
+sudo mkdir -p SOME-PATH/scripts
+sudo cp cluster_health_check.py SOME-PATH/scripts/
+sudo chmod +x SOME-PATH/scripts/cluster_health_check.py
+```
 
-#### 4. Node Memory Usage Percentage
-- **PromQL Query:** `100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))`
-- **Mechanism:**
-  - In Linux, unused memory is utilized for caching and buffers. Therefore, querying `node_memory_MemFree_bytes` gives a misleadingly high usage estimate.
-  - Using `node_memory_MemAvailable_bytes` accurately represents how much memory can be allocated without causing the system to swap.
-  - Dividing available bytes by total bytes gives the available ratio; subtracting from 1 and multiplying by 100 provides the actual memory utilization percentage.
-  - **Threshold:** Under 90% is `[HEALTHY]`.
+`crontab -e`:
+```bash
+*/5 * * * * /usr/bin/python3 SOME-PATH/scripts/cluster_health_check.py >> /var/log/cluster_health_check.log 2>&1
+```
 
-#### 5. Detecting Memory Leaks
-- **PromQL Query:** `delta(process_resident_memory_bytes{job='kubernetes-services'}[24h]) > 0`
-- **Mechanism:**
-  - `process_resident_memory_bytes` tracks the resident set size (RSS) memory currently allocated to the process.
-  - The `delta(...[24h])` function compares the memory footprint from 24 hours ago to now. A positive delta (`> 0`) indicates steady memory growth, which is a symptom of a potential memory leak.
-  - For each detected service, the script calculates growth in megabytes:
-    ```python
-    mem_mb = float(leak["value"][1]) / 1000
-    ```
-  - **Threshold:** If no services show positive growth, it reports `[HEALTHY]`; otherwise, it raises a `[Warning]` and displays the affected service and growth amount.
-
-#### 6. Loki Log Streaming & Error Filtering
-- **Endpoint:** `http://localhost:31100/loki/api/v1/query_range`
-- **LogQL Query:** `{service_name=~"simple-app-sender|simple-web-app"} |~ "(?i)ERROR|FAIL"`
-- **Mechanism:**
-  - Queries Loki over HTTP, using regex to match both applications and scanning for case-insensitive `ERROR` or `FAIL` tokens.
-  - Response parsing unpacks nested streams and log entries:
-    ```python
-    problems = [
-        line 
-        for stream in data 
-        for _, line in stream.get("values", [])
-    ]
-    ```
-  - Wrapped in a `try...except requests.exceptions.RequestException` block to ensure that a Loki timeout or connection glitch does not crash the entire health checker.
-  - **Threshold:** If `len(problems) == 0`, logs are marked `[HEALTHY]`; otherwise, it outputs a `[Warning]` with the count and lines.
-
-#### 7. Terminal Styling & HTML Export with `rich`
-- Initializes `Console(record=True)` from the `rich` library.
-- Color codes output using semantic markup:
-  - `[bold green][HEALTHY][/bold green]`
-  - `[bold red][NOT HEALTHY][/bold red]`
-  - `[bold yellow][Warning][/bold yellow]`
-- Generates an HTML report via `console.save_html("cluster_metrics.html")`, producing a self-contained web page of the health check.
-
----
-
-### Task Automation with Cron
-
-To satisfy the bootcamp objective of running this check every 5 minutes on the K3s host VM (outside of K3s pods):
-
-1. **Deploy Script on Host VM:**
-   ```bash
-   sudo mkdir -p SOME-PATH/scripts
-   sudo cp cluster_health_check.py SOME-PATH/scripts/
-   sudo chmod +x SOME-PATH/scripts/cluster_health_check.py
-   ```
-
-2. **Install Required Python Dependencies on VM:**
-   ```bash
-   sudo apt update
-   sudo apt install -y python3 python3-pip
-   pip3 install requests rich
-   ```
-
-3. **Configure User Crontab:**
-   Edit the crontab using `crontab -e`:
-   ```bash
-   # Run cluster health check every 5 minutes and log output
-   */5 * * * * /usr/bin/python3 SOME-PATH/scripts/cluster_health_check.py >> /var/log/cluster_health_check.log 2>&1
-   ```
-
-4. **Verify Execution:**
-   Inspect the log file after 5 minutes:
-   ```bash
-   tail -n 30 /var/log/cluster_health_check.log
-   ```
+Verify: `tail -n 30 /var/log/cluster_health_check.log`
 
 ---
 
 ## Phase 3: Bash Resource Monitor
 
-### The Bash Script
-
-Here is the complete script (`vm_weekly_report.sh`):
+### The Script (`vm_weekly_report.sh`)
 
 ```bash
 #!/bin/bash
@@ -337,92 +250,46 @@ df -h '/dev/sda2' >>$file
 echo "#-----------------#" >>$file
 ```
 
----
+### What It Does
 
-### Deep Dive: How the Script Works
+- **Rotation:** On Sunday, `>` overwrites the file. On other days, `>>` appends to it. This keeps the file from growing forever.
+- **CPU:** `sar` (from `sysstat`) prints the column header and the daily `Average:` line.
+- **RAM:** `free -h`
+- **Disk:** `df -h /dev/sda2` (root partition)
 
-This script collects native OS-level performance metrics and manages weekly file rotation.
+### Cron: Sundays at 3:00 PM
 
-#### 1. Weekly Log Rotation Mechanism
 ```bash
-file='vm_weekly_report.log'
-day=$(date +"%a")
+# sar needs sysstat installed and enabled
+sudo apt install -y sysstat
+sudo sed -i 's/ENABLED="false"/ENABLED="true"/' /etc/default/sysstat
+sudo systemctl enable --now sysstat
 
-case $day in
-Mon | Tue | Wed | Thu | Fri | Sat)
-  date >>$file
-  ;;
-
-Sun)
-  date >$file
-  ;;
-esac
+# Deploy
+sudo cp vm_weekly_report.sh SOME-PATH/scripts/
+sudo chmod +x SOME-PATH/scripts/vm_weekly_report.sh
 ```
-- `date +"%a"` returns the short day name (`Mon`, `Tue`, `Wed`, `Thu`, `Fri`, `Sat`, `Sun`).
-- **Rotation Logic:**
-  - When running Monday through Saturday, `date >> $file` **appends** to the existing log file.
-  - When running on **Sunday**, `date > $file` **overwrites** (truncates) the file, resetting the weekly report with Sunday's initial timestamp.
-  - This simple rotation mechanism ensures the report file never grows indefinitely.
 
-#### 2. CPU Metrics via `sar` (System Activity Reporter)
-- `sar` is part of the `sysstat` package. It reads historical CPU utilization samples gathered by the system activity collector:
-  ```bash
-  sar | grep %user >>$file
-  sar | grep '^Average:' >>$file
-  ```
-  - `grep %user` captures the table header row, detailing columns like `%user`, `%nice`, `%system`, `%iowait`, `%steal`, and `%idle`.
-  - `grep '^Average:'` grabs the final summary calculation line representing average CPU load across the day.
+`crontab -e`:
+```bash
+0 15 * * 0 SOME-PATH/scripts/vm_weekly_report.sh
+```
 
-#### 3. Memory Statistics via `free`
-- `free -h >>$file` appends human-readable memory statistics (megabytes/gigabytes), displaying total, used, free, shared, buff/cache, and available RAM, as well as Swap utilization.
+### Sample Output
 
-#### 4. Disk Partition Utilization via `df`
-- `df -h '/dev/sda2' >>$file` captures the disk capacity, used blocks, available space, and percentage utilization for the main root OS filesystem (`/dev/sda2`).
+```text
+Sun Oct 18 15:00:01 UTC 2026
+12:00:01 AM     CPU     %user     %nice   %system   %iowait    %steal     %idle
+Average:        all      3.42      0.00      1.15      0.22      0.00     95.21
 
-#### 5. Section Delimiters
-- `echo "#-----------------#" >>$file` appends a clean separator at the end of each run to clearly separate successive snapshots.
+               total        used        free      shared  buff/cache   available
+Mem:           7.7Gi       2.1Gi       3.8Gi        18Mi       1.8Gi       5.3Gi
+Swap:          2.0Gi          0B       2.0Gi
 
----
-
-### Task Automation with Cron
-
-The objective requires running this Bash monitor at **3:00 PM every Sunday**.
-
-1. **Deploy Script on Host VM:**
-   ```bash
-   sudo cp vm_weekly_report.sh /opt/monitoring/scripts/
-   sudo chmod +x SOME-PATH/vm_weekly_report.sh
-   ```
-
-2. **Ensure `sysstat` is Installed & Enabled:**
-   Since the script uses `sar`, `sysstat` must be installed and active:
-   ```bash
-   sudo apt install -y sysstat
-   sudo sed -i 's/ENABLED="false"/ENABLED="true"/' /etc/default/sysstat
-   sudo systemctl enable --now sysstat
-   ```
-
-3. **Configure User Crontab:**
-   Edit crontab using `crontab -e`:
-   ```bash
-   # Run VM resource monitor every Sunday at 3:00 PM (15:00)
-   0 15 * * 0 /opt/monitoring/scripts/vm_weekly_report.sh
-   ```
-
-4. **Sample Output (`vm_weekly_report.log`):**
-   ```text
-   Sun Oct 18 15:00:01 UTC 2026
-   12:00:01 AM     CPU     %user     %nice   %system   %iowait    %steal     %idle
-   Average:        all      3.42      0.00      1.15      0.22      0.00     95.21
-
-                  total        used        free      shared  buff/cache   available
-   Mem:           7.7Gi       2.1Gi       3.8Gi        18Mi       1.8Gi       5.3Gi
-   Swap:          2.0Gi          0B       2.0Gi
-
-   Filesystem      Size  Used Avail Use% Mounted on
-   /dev/sda2        49G   14G   33G  30% /
-   #-----------------#
-   ```
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda2        49G   14G   33G  30% /
+#-----------------#
+```
 
 ---
 
